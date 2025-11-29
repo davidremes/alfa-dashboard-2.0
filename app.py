@@ -160,27 +160,55 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# --- 2. FUNKCE PRO ZÍSKÁNÍ DAT (PŮVODNÍ, FUNKČNÍ LOGIKA) ---
+# --- 2. FUNKCE PRO ZÍSKÁNÍ DAT ---
 
-# Funkce pro mapování XTB symbolů na yfinance tickery a měny
+# Funkce pro mapování XTB symbolů na yfinance tickery a měny (NOVÝ HYBRIDNÍ VZOR)
 def get_ticker_and_currency(symbol):
     symbol_upper = symbol.upper()
     
-    if symbol_upper == 'CSPX.UK' or symbol_upper == 'CSPX':
-        return 'CSPX.L', 'USD' 
-    if symbol_upper == 'CNDX.UK' or symbol_upper == 'CNDX':
-        return 'CNDX.L', 'USD' 
-    if 'TUI' in symbol_upper and symbol_upper.endswith('.DE'):
-        return 'TUI1.DE', 'EUR'
-    elif symbol_upper.endswith('.US'):
+    # === VZOR 1: STATICKÁ MAPA PRO ZNÁMÉ VÝJIMKY (NEJVYŠŠÍ PRIORITA) ===
+    # Formát: 'XTB_SYMBOL': ('YFINANCE_TICKER', 'MĚNA')
+    TICKER_MAP = {
+        # Fixy pro ETF
+        'CSPX.UK': ('CSPX.L', 'USD'), 
+        'CSPX': ('CSPX.L', 'USD'), 
+        'CNDX.UK': ('CNDX.L', 'USD'),
+        'CNDX': ('CNDX.L', 'USD'),
+        
+        # Explicitní fixy pro akcie, které zlobí
+        'TUI.DE': ('TUI1.DE', 'EUR'),       # TUI AG: XTB TUI.DE -> YF TUI1.DE
+        'STLAM.IT': ('STLA.MI', 'EUR'),     # Stellantis N.V.: XTB STLAM.IT -> YF STLA.MI
+        # Zde můžete přidávat další problematické tickery (vždy s vysokou prioritou)
+    }
+
+    # 1. Nejprve zkontrolujeme explicitní mapování
+    if symbol_upper in TICKER_MAP:
+        return TICKER_MAP[symbol_upper]
+    
+    # === VZOR 2: GENERICKÁ PRAVIDLA PRO KONCOVKY (FALLBACK) ===
+    
+    # 2. Pravidlo pro USA: Odstranit .US nebo .USD (problém s Google)
+    if symbol_upper.endswith('.US'):
         return symbol_upper[:-3], 'USD'
+    elif symbol_upper.endswith('.USD'):
+        # Toto řeší GOOGL.USD
+        return symbol_upper[:-4], 'USD'
+            
+    # 3. Pravidlo pro Německo: Zachovat koncovku .DE
     elif symbol_upper.endswith('.DE'):
         return symbol_upper[:-3] + '.DE', 'EUR'
+        
+    # 4. Pravidlo pro Itálii: Převést na .MI (Milán)
     elif symbol_upper.endswith('.IT'):
-        return symbol_upper[:-3] + '.MI', 'EUR'
+        return symbol_upper[:-3] + '.MI', 'EUR' 
+        
+    # 5. Pravidlo pro UK: Převést na .L (LSE)
     elif symbol_upper.endswith('.UK'):
         return symbol_upper[:-3] + '.L', 'GBP' 
+        
+    # 6. Výchozí hodnota
     return symbol, 'USD'
+
 
 # Funkce pro stažení aktuálních cen (batch processing + Caching)
 @st.cache_data(ttl=600)
@@ -199,11 +227,13 @@ def get_current_prices(symbols):
             rates_data = yf.download(currency_tickers, period='1d', progress=False)['Close']
             if isinstance(rates_data, pd.Series):
                 currency = currency_tickers[0].split('USD=X')[0]
-                currency_rates[currency] = rates_data.iloc[-1]
+                # Zajištění, že bereme poslední platnou hodnotu
+                currency_rates[currency] = rates_data.iloc[-1] if not rates_data.empty and pd.notna(rates_data.iloc[-1]) else 1.0
             else:
                 for curr_ticker in currency_tickers:
                     currency = curr_ticker.split('USD=X')[0]
-                    rate = rates_data[curr_ticker].iloc[-1] if not rates_data[curr_ticker].empty else 1.0
+                    # Zajištění, že bereme poslední platnou hodnotu
+                    rate = rates_data[curr_ticker].iloc[-1] if not rates_data[curr_ticker].empty and pd.notna(rates_data[curr_ticker].iloc[-1]) else 1.0
                     currency_rates[currency] = rate
         except:
             st.warning("Problém se stažením kurzu, používám výchozí 1.0.")
@@ -215,7 +245,7 @@ def get_current_prices(symbols):
         data = yf.download(yf_tickers, period='1d', progress=False)['Close']
         if isinstance(data, pd.Series): 
             ticker = yf_tickers[0]
-            price = data.iloc[-1]
+            price = data.iloc[-1] if not data.empty and pd.notna(data.iloc[-1]) else 0
             for symbol, (t, curr) in ticker_map.items():
                 if t == ticker:
                     prices[symbol] = price * currency_rates.get(curr, 1.0)
@@ -223,7 +253,7 @@ def get_current_prices(symbols):
         else: 
             for symbol, (ticker, currency) in ticker_map.items():
                 try:
-                    price = data[ticker].iloc[-1]
+                    price = data[ticker].iloc[-1] if not data[ticker].empty and pd.notna(data[ticker].iloc[-1]) else 0
                     prices[symbol] = price * currency_rates.get(currency, 1.0)
                 except (KeyError, IndexError):
                     prices[symbol] = 0
@@ -259,10 +289,12 @@ def calculate_positions(transactions):
 @st.cache_data(ttl=3600)
 def get_historical_prices(symbols, start_date, end_date):
     hist_prices = {}
+    # Získání jedinečných měn k převodu
     currencies = set(get_ticker_and_currency(s)[1] for s in symbols if get_ticker_and_currency(s)[1] != 'USD')
     hist_rates = {}
     currency_tickers = [f"{curr}USD=X" for curr in currencies]
     
+    # Stažení historických kurzů měn
     if currency_tickers:
         try:
             rates_df = yf.download(currency_tickers, start=start_date, end=end_date, progress=False)['Close']
@@ -274,17 +306,20 @@ def get_historical_prices(symbols, start_date, end_date):
                     ticker = f"{curr}USD=X"
                     hist_rates[curr] = rates_df[ticker].fillna(method='ffill')
         except:
-            pass
+            pass # Chyba pri stahování kurzu, ignorujeme a použijeme default USD
             
     for symbol in symbols:
         ticker, currency = get_ticker_and_currency(symbol)
         try:
-            # Původní metoda Ticker().history()
+            # Stažení historických cen akcie/ETF
             df = yf.Ticker(ticker).history(start=start_date, end=end_date) 
             prices = df['Close'].fillna(method='ffill')
+            
+            # Přepočet do USD pomocí historických kurzů
             if currency != 'USD' and currency in hist_rates:
                 rates = hist_rates[currency].reindex(prices.index, method='ffill')
                 prices = prices * rates
+            
             hist_prices[symbol] = prices
             
         except Exception:
@@ -336,7 +371,7 @@ if uploaded_file is not None:
             # NAČTENÍ CASH OPERATION HISTORY
             if cash_sheet:
                  df_full_cash = pd.read_excel(uploaded_file, sheet_name=cash_sheet, header=None)
-                 # Hledání hlavičky 'ID' - předpokládáme 10 řádek nad "ID"
+                 # Hledání hlavičky 'ID' - předpokládáme, že je blízko
                  header_index_cash = df_full_cash[df_full_cash.iloc[:, 1].astype(str) == 'ID'].index.min()
                  if not pd.isna(header_index_cash):
                      df_cash = pd.read_excel(uploaded_file, sheet_name=cash_sheet, header=header_index_cash).dropna(how='all')
@@ -344,22 +379,15 @@ if uploaded_file is not None:
                      df_cash = pd.read_excel(uploaded_file, sheet_name=cash_sheet, header=10).dropna(how='all')
                  st.success("Načtena historie hotovostních operací (pro dividendy).")
 
-        else: # HANDLING CSV FILES
+        else: # HANDLING CSV FILES (Zjednodušené)
             df_temp = pd.read_csv(uploaded_file, header=10).dropna(how='all')
             
-            # Zjednodušená detekce pro CSV
-            if 'Gross P/L' in df_temp.columns and 'Position' in df_temp.columns:
-                df_closed = df_temp
-                st.success("Načten CSV soubor: Uzavřené pozice.")
-                
-            elif 'Purchase value' in df_temp.columns and 'Volume' in df_temp.columns:
+            if 'Purchase value' in df_temp.columns and 'Volume' in df_temp.columns:
                 df_open = df_temp
                 st.success("Načten CSV soubor: Otevřené pozice.")
-            
             elif 'Type' in df_temp.columns and 'Amount' in df_temp.columns and 'DIVIDENT' in df_temp['Type'].astype(str).unique():
                  df_cash = df_temp
                  st.success("Načten CSV soubor: Hotovostní operace (pro dividendy).")
-            
             else:
                 st.warning("Načten CSV soubor, ale nebyl rozpoznán jako standardní report. Zkusíme jej zpracovat jako Otevřené pozice.")
                 df_open = df_temp
@@ -377,15 +405,14 @@ if uploaded_file is not None:
         
         # --- 4. Inicializace, stažení dat a přepočet ---
         
+        # Kontrola, zda se data načítají poprvé nebo zda se změnil soubor
         if 'positions_df' not in st.session_state or st.session_state.get('uploaded_file_name') != uploaded_file.name:
             with st.spinner('Počítám metriky a stahuji data z Yahoo Finance...'):
                 positions = calculate_positions(df_open)
                 
                 # VÝPOČET DIVIDEND
                 if 'Type' in df_cash.columns and 'Amount' in df_cash.columns:
-                    # Filter for 'DIVIDENT' type and sum the 'Amount' column
                     dividends_df = df_cash[df_cash['Type'].astype(str).str.upper().str.contains('DIVIDENT', na=False)]
-                    # Suma je v USD, protože report je v USD
                     total_dividends = dividends_df['Amount'].sum() if not dividends_df.empty else 0
                 else:
                     total_dividends = 0
@@ -585,11 +612,12 @@ if uploaded_file is not None:
         
         def categorize_asset(symbol):
             symbol_upper = symbol.upper()
-            # Explicitně identifikujeme ETF (CSPX, CNDX), zbytek s evropskou koncovkou budou Akcie EU.
+            # Explicitně identifikujeme ETF (CSPX, CNDX) a EU akcie pro EU/ETF kategorii
             if 'CSPX' in symbol_upper or 'CNDX' in symbol_upper:
                 return 'ETF (EU)' 
             elif symbol_upper.endswith('.UK') or symbol_upper.endswith('.DE') or symbol_upper.endswith('.IT'):
-                return 'Akcie (EU)' # Sem spadne TUI a Stellantis
+                return 'Akcie (EU)' 
+            # Zbytek je US nebo jiné
             else:
                 return 'Akcie (US/Jiné)'
 
@@ -606,7 +634,7 @@ if uploaded_file is not None:
                     allocation_df,
                     values='Velikost pozice (USD)',
                     names='Kategorie',
-                    title='**Alokace: ETF vs. Akcie**',
+                    title='**Alokace podle Typu**',
                     template='plotly_dark' 
                 )
                 
