@@ -1,12 +1,14 @@
+# app.py
+
 import streamlit as st
 import pandas as pd
-import yfinance as yf
 from datetime import datetime
 import numpy as np
 import plotly.express as px
-import warnings 
-# Potlačení FutureWarnings (které často generuje yfinance)
-warnings.simplefilter(action='ignore', category=FutureWarning)
+
+# --- DŮLEŽITÉ: IMPORT FUNKCÍ Z NOVÉHO SOUBORU utils.py ---
+from utils import get_current_prices, get_historical_prices, calculate_positions 
+
 
 # --- 1. KOSMETIKA & CSS (Styling pro čistě černý motiv - MAXIMÁLNÍ VYNUCENÍ) ---
 st.markdown("""
@@ -160,174 +162,6 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# --- 2. FUNKCE PRO ZÍSKÁNÍ DAT ---
-
-# Funkce pro mapování XTB symbolů na yfinance tickery a měny (NOVÝ HYBRIDNÍ VZOR)
-def get_ticker_and_currency(symbol):
-    symbol_upper = symbol.upper()
-    
-    # === VZOR 1: STATICKÁ MAPA PRO ZNÁMÉ VÝJIMKY (NEJVYŠŠÍ PRIORITA) ===
-    # Formát: 'XTB_SYMBOL': ('YFINANCE_TICKER', 'MĚNA')
-    TICKER_MAP = {
-        # Fixy pro ETF
-        'CSPX.UK': ('CSPX.L', 'USD'), 
-        'CSPX': ('CSPX.L', 'USD'), 
-        'CNDX.UK': ('CNDX.L', 'USD'),
-        'CNDX': ('CNDX.L', 'USD'),
-        
-        # Explicitní fixy pro akcie, které zlobí
-        'TUI.DE': ('TUI1.DE', 'EUR'),       # TUI AG: XTB TUI.DE -> YF TUI1.DE
-        'STLAM.IT': ('STLA.MI', 'EUR'),     # Stellantis N.V.: XTB STLAM.IT -> YF STLA.MI
-        # Zde můžete přidávat další problematické tickery (vždy s vysokou prioritou)
-    }
-
-    # 1. Nejprve zkontrolujeme explicitní mapování
-    if symbol_upper in TICKER_MAP:
-        return TICKER_MAP[symbol_upper]
-    
-    # === VZOR 2: GENERICKÁ PRAVIDLA PRO KONCOVKY (FALLBACK) ===
-    
-    # 2. Pravidlo pro USA: Odstranit .US nebo .USD (problém s Google)
-    if symbol_upper.endswith('.US'):
-        return symbol_upper[:-3], 'USD'
-    elif symbol_upper.endswith('.USD'):
-        # Toto řeší GOOGL.USD
-        return symbol_upper[:-4], 'USD'
-            
-    # 3. Pravidlo pro Německo: Zachovat koncovku .DE
-    elif symbol_upper.endswith('.DE'):
-        return symbol_upper[:-3] + '.DE', 'EUR'
-        
-    # 4. Pravidlo pro Itálii: Převést na .MI (Milán)
-    elif symbol_upper.endswith('.IT'):
-        return symbol_upper[:-3] + '.MI', 'EUR' 
-        
-    # 5. Pravidlo pro UK: Převést na .L (LSE)
-    elif symbol_upper.endswith('.UK'):
-        return symbol_upper[:-3] + '.L', 'GBP' 
-        
-    # 6. Výchozí hodnota
-    return symbol, 'USD'
-
-
-# Funkce pro stažení aktuálních cen (batch processing + Caching)
-@st.cache_data(ttl=600)
-def get_current_prices(symbols):
-    if not symbols:
-        return {}
-    ticker_map = {symbol: get_ticker_and_currency(symbol) for symbol in symbols}
-    yf_tickers = [v[0] for v in ticker_map.values()]
-    currencies_to_fetch = set(v[1] for v in ticker_map.values() if v[1] != 'USD')
-    currency_rates = {'USD': 1.0}
-    currency_tickers = [f"{curr}USD=X" for curr in currencies_to_fetch]
-    
-    # Původní, méně agresivní ošetření chyb pro aktuální ceny
-    if currency_tickers:
-        try:
-            rates_data = yf.download(currency_tickers, period='1d', progress=False)['Close']
-            if isinstance(rates_data, pd.Series):
-                currency = currency_tickers[0].split('USD=X')[0]
-                # Zajištění, že bereme poslední platnou hodnotu
-                currency_rates[currency] = rates_data.iloc[-1] if not rates_data.empty and pd.notna(rates_data.iloc[-1]) else 1.0
-            else:
-                for curr_ticker in currency_tickers:
-                    currency = curr_ticker.split('USD=X')[0]
-                    # Zajištění, že bereme poslední platnou hodnotu
-                    rate = rates_data[curr_ticker].iloc[-1] if not rates_data[curr_ticker].empty and pd.notna(rates_data[curr_ticker].iloc[-1]) else 1.0
-                    currency_rates[currency] = rate
-        except:
-            st.warning("Problém se stažením kurzu, používám výchozí 1.0.")
-            pass 
-            
-    prices = {}
-    
-    try:
-        data = yf.download(yf_tickers, period='1d', progress=False)['Close']
-        if isinstance(data, pd.Series): 
-            ticker = yf_tickers[0]
-            price = data.iloc[-1] if not data.empty and pd.notna(data.iloc[-1]) else 0
-            for symbol, (t, curr) in ticker_map.items():
-                if t == ticker:
-                    prices[symbol] = price * currency_rates.get(curr, 1.0)
-                    break
-        else: 
-            for symbol, (ticker, currency) in ticker_map.items():
-                try:
-                    price = data[ticker].iloc[-1] if not data[ticker].empty and pd.notna(data[ticker].iloc[-1]) else 0
-                    prices[symbol] = price * currency_rates.get(currency, 1.0)
-                except (KeyError, IndexError):
-                    prices[symbol] = 0
-    except:
-        st.error("Nepodařilo se stáhnout ceny pro jeden nebo více symbolů (pravděpodobně chyba Yahoo Finance). Používám 0 pro chybějící data.")
-        for symbol in symbols:
-             prices[symbol] = 0
-             
-    return prices
-
-# Funkce pro výpočet otevřených pozic (statická data z reportu)
-def calculate_positions(transactions):
-    positions = {}
-    for _, row in transactions.iterrows():
-        if pd.isna(row['Symbol']): continue
-        symbol = row['Symbol']
-        quantity = row['Volume']
-        purchase_value = row['Purchase value']
-        transaction_type = row['Type']
-        if symbol not in positions:
-            positions[symbol] = {'quantity': 0, 'total_cost': 0}
-        if 'BUY' in transaction_type.upper():
-            positions[symbol]['quantity'] += quantity
-            positions[symbol]['total_cost'] += purchase_value
-    for symbol in positions:
-        if positions[symbol]['quantity'] > 0:
-            positions[symbol]['avg_price'] = positions[symbol]['total_cost'] / positions[symbol]['quantity']
-        else:
-            positions[symbol]['avg_price'] = 0
-    return {k: v for k, v in positions.items() if v['quantity'] > 0} 
-
-# Historická data (s cachingem) - PŮVODNÍ, FUNKČNÍ LOGIKA
-@st.cache_data(ttl=3600)
-def get_historical_prices(symbols, start_date, end_date):
-    hist_prices = {}
-    # Získání jedinečných měn k převodu
-    currencies = set(get_ticker_and_currency(s)[1] for s in symbols if get_ticker_and_currency(s)[1] != 'USD')
-    hist_rates = {}
-    currency_tickers = [f"{curr}USD=X" for curr in currencies]
-    
-    # Stažení historických kurzů měn
-    if currency_tickers:
-        try:
-            rates_df = yf.download(currency_tickers, start=start_date, end=end_date, progress=False)['Close']
-            if isinstance(rates_df, pd.Series):
-                currency = currency_tickers[0].split('USD=X')[0]
-                hist_rates[currency] = rates_df.fillna(method='ffill')
-            else:
-                for curr in currencies:
-                    ticker = f"{curr}USD=X"
-                    hist_rates[curr] = rates_df[ticker].fillna(method='ffill')
-        except:
-            pass # Chyba pri stahování kurzu, ignorujeme a použijeme default USD
-            
-    for symbol in symbols:
-        ticker, currency = get_ticker_and_currency(symbol)
-        try:
-            # Stažení historických cen akcie/ETF
-            df = yf.Ticker(ticker).history(start=start_date, end=end_date) 
-            prices = df['Close'].fillna(method='ffill')
-            
-            # Přepočet do USD pomocí historických kurzů
-            if currency != 'USD' and currency in hist_rates:
-                rates = hist_rates[currency].reindex(prices.index, method='ffill')
-                prices = prices * rates
-            
-            hist_prices[symbol] = prices
-            
-        except Exception:
-            hist_prices[symbol] = pd.Series()
-            
-    return hist_prices
-
-
 # --- 3. HLAVNÍ ČÁST APLIKACE ---
 
 st.title('Alfa Dashboard')
@@ -336,8 +170,8 @@ st.info('Nahraj Excel/CSV report z XTB. Všechny hodnoty jsou automaticky převe
 uploaded_file = st.file_uploader('Nahraj CSV nebo Excel report z XTB', type=['csv', 'xlsx'])
 
 df_open = pd.DataFrame()
-df_closed = pd.DataFrame() # Bude sice stále načten pro kompatibilitu, ale nepoužit pro zisk
-df_cash = pd.DataFrame() # Nový DataFrame pro hotovostní operace (dividendy)
+df_closed = pd.DataFrame() 
+df_cash = pd.DataFrame() 
 
 # Načítání souboru
 if uploaded_file is not None:
@@ -347,7 +181,6 @@ if uploaded_file is not None:
             sheets = excel.sheet_names
             open_sheet = next((s for s in sheets if 'OPEN POSITION' in s.upper()), None)
             closed_sheet = next((s for s in sheets if 'CLOSED POSITION' in s.upper()), None)
-            # NOVÝ SHEET pro hotovostní operace
             cash_sheet = next((s for s in sheets if 'CASH OPERATION' in s.upper()), None)
             
             # --- Robustní hledání hlaviček ---
@@ -371,7 +204,6 @@ if uploaded_file is not None:
             # NAČTENÍ CASH OPERATION HISTORY
             if cash_sheet:
                  df_full_cash = pd.read_excel(uploaded_file, sheet_name=cash_sheet, header=None)
-                 # Hledání hlavičky 'ID' - předpokládáme, že je blízko
                  header_index_cash = df_full_cash[df_full_cash.iloc[:, 1].astype(str) == 'ID'].index.min()
                  if not pd.isna(header_index_cash):
                      df_cash = pd.read_excel(uploaded_file, sheet_name=cash_sheet, header=header_index_cash).dropna(how='all')
@@ -408,7 +240,7 @@ if uploaded_file is not None:
         # Kontrola, zda se data načítají poprvé nebo zda se změnil soubor
         if 'positions_df' not in st.session_state or st.session_state.get('uploaded_file_name') != uploaded_file.name:
             with st.spinner('Počítám metriky a stahuji data z Yahoo Finance...'):
-                positions = calculate_positions(df_open)
+                positions = calculate_positions(df_open) # Zde voláme funkci z utils.py
                 
                 # VÝPOČET DIVIDEND
                 if 'Type' in df_cash.columns and 'Amount' in df_cash.columns:
@@ -424,7 +256,7 @@ if uploaded_file is not None:
                     st.session_state['total_dividends'] = 0 
                 else:
                     symbols = list(positions.keys())
-                    current_prices = get_current_prices(symbols)
+                    current_prices = get_current_prices(symbols) # Zde voláme funkci z utils.py
 
                     table_data = []
                     total_invested = sum(pos['total_cost'] for pos in positions.values())
@@ -557,7 +389,7 @@ if uploaded_file is not None:
 
         with st.spinner(f'Načítám historická data pro {period}...'):
             symbols_hist = [s for s in positions_df['Název'].unique()]
-            hist_prices = get_historical_prices(symbols_hist, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'))
+            hist_prices = get_historical_prices(symbols_hist, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')) # Zde voláme funkci z utils.py
             
             portfolio_history = pd.DataFrame(index=pd.to_datetime(pd.date_range(start=start_date, end=end_date)))
             
